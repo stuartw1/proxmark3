@@ -627,6 +627,12 @@ static int CmdLFHitagReader(const char *Cmd) {
 
         // block3, 1 byte
         printHitag2Configuration(data[4 * 3]);
+        for (size_t i = 1; i <= 48; i++) {
+            printf("%02X", data[i]);
+            if (i % 4 == 0 && i != 0) {
+                printf("\n");
+            }
+        }
     }
     return PM3_SUCCESS;
 }
@@ -820,9 +826,9 @@ static int CmdLFHitag2Dump(const char *Cmd) {
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
-    uint8_t filename[FILE_PATH_SIZE] = {0};
+    char filename[FILE_PATH_SIZE] = {0};
     int fnlen = 0;
-    int res = CLIParamHexToBuf(arg_get_str(ctx, 1), filename, sizeof(filename), &fnlen);
+    int res = CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *) filename, sizeof(filename), &fnlen);
     if (res != 0) {
         CLIParserFree(ctx);
         return PM3_EINVARG;
@@ -846,7 +852,7 @@ static int CmdLFHitag2Dump(const char *Cmd) {
 
     PrintAndLogEx(WARNING, "to be implemented...");
 
-    /*
+    
         PrintAndLogEx(SUCCESS, "Dumping tag memory...");
 
         clearCommandBuffer();
@@ -854,12 +860,21 @@ static int CmdLFHitag2Dump(const char *Cmd) {
         PacketResponseNG resp;
         uint8_t *data = resp.data.asBytes;
         if (fnlen < 1) {
-            char *fptr = filename + snprintf(filename, sizeof(filename), "lf-hitag-");
+            char *fptr = filename;
+            fptr += snprintf(fptr, sizeof(filename), "lf-hitag-");
             FillFileNameByUID(fptr, data, "-dump", 4);
         }
+        
+        for (size_t i = 1; i <= 48; i++) {
+            printf("%02X", data[i]);
+            if (i % 4 == 0 && i != 0) {
+                printf("\n");
+            }
+        }
+        printf("\n");
 
         pm3_save_dump(filename, data, 48, jsfHitag, 4);
-    */
+    
     return PM3_SUCCESS;
 }
 
