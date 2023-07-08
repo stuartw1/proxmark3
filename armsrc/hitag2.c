@@ -1310,29 +1310,9 @@ void SniffHitag2(bool ledcontrol) {
 
 }
 
-// Hitag2 simulation
-void SimulateHitag2(bool ledcontrol) {
-
-    BigBuf_free();
-    BigBuf_Clear_ext(false);
-    clear_trace();
-    set_tracing(true);
-
-    // empties bigbuff etc
-    lf_init(false, true, ledcontrol);
-
-    int response = 0;
-    uint8_t rx[HITAG_FRAME_LEN] = {0};
-    uint8_t tx[HITAG_FRAME_LEN] = {0};
-
-    auth_table_len = 0;
-    auth_table_pos = 0;
-//    auth_table = BigBuf_malloc(AUTH_TABLE_LENGTH);
-//    memset(auth_table, 0x00, AUTH_TABLE_LENGTH);
-
-    // Reset the received frame, frame count and timing info
-//    memset(rx, 0x00, sizeof(rx));
-//    memset(tx, 0x00, sizeof(tx));
+// Hitag2 simulation Biphase
+void SimulateHitag2(bool ledcontrol)
+{
 
     DbpString("Starting Hitag2 simulation");
 
@@ -1341,158 +1321,214 @@ void SimulateHitag2(bool ledcontrol) {
 
     // printing
     uint32_t block = 0;
-    for (size_t i = 0; i < 12; i++) {
+    for (size_t i = 0; i < 12; i++)
+    {
 
         // num2bytes?
-        for (size_t j = 0; j < 4; j++) {
+        for (size_t j = 0; j < 4; j++)
+        {
             block <<= 8;
             block |= tag.sectors[i][j];
         }
         Dbprintf("| %d | %08x |", i, block);
     }
 
-    size_t max_nrzs = 8 * HITAG_FRAME_LEN + 5;
-    uint8_t nrz_samples[max_nrzs];
-
-//    uint32_t command_start = 0, command_duration = 0;
+    //    uint32_t command_start = 0, command_duration = 0;
     //  int16_t checked = 0;
 
-// SIMULATE
-    uint32_t signal_size = 10000;
-    while (BUTTON_PRESS() == false) {
+    // SIMULATE
+    if (ledcontrol)
+        LED_D_ON();
 
-        // use malloc
-        initSampleBufferEx(&signal_size, true);
+    FpgaDownloadAndGo(FPGA_BITSTREAM_LF);
 
-        if (ledcontrol) {
-            LED_D_ON();
-            LED_A_OFF();
-        }
+    BigBuf_free();
+    BigBuf_Clear_ext(false);
+    clear_trace();
+    set_tracing(true);
 
-//        lf_reset_counter();
+    // Set up eavesdropping mode, frequency divisor which will drive the FPGA
+    // and analog mux selection.
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_EDGE_DETECT | FPGA_LF_EDGE_DETECT_TOGGLE_MODE);
+    FpgaSendCommand(FPGA_CMD_SET_DIVISOR, 95); // 125Khz
+    SetAdcMuxFor(GPIO_MUXSEL_LOPKD);
+    RELAY_OFF();
+
+    // Configure output pin that is connected to the FPGA (for modulating)
+    AT91C_BASE_PIOA->PIO_OER = GPIO_SSC_DOUT;
+    AT91C_BASE_PIOA->PIO_PER = GPIO_SSC_DOUT;
+
+    // Disable modulation, we are going to eavesdrop, not modulate ;)
+    LOW(GPIO_SSC_DOUT);
+
+    // Enable Peripheral Clock for TIMER_CLOCK1, used to capture edges of the reader frames
+    AT91C_BASE_PMC->PMC_PCER = (1 << AT91C_ID_TC1);
+    AT91C_BASE_PIOA->PIO_BSR = GPIO_SSC_FRAME;
+
+    // Disable timer during configuration
+    AT91C_BASE_TC1->TC_CCR = AT91C_TC_CLKDIS;
+
+    // Capture mode, default timer source = MCK/2 (TIMER_CLOCK1), TIOA is external trigger,
+    // external trigger rising edge, load RA on rising edge of TIOA.
+    AT91C_BASE_TC1->TC_CMR = AT91C_TC_CLKS_TIMER_DIV1_CLOCK | AT91C_TC_ETRGEDG_BOTH | AT91C_TC_ABETRG | AT91C_TC_LDRA_BOTH;
+
+    // Enable and reset counter
+    AT91C_BASE_TC1->TC_CCR = AT91C_TC_CLKEN | AT91C_TC_SWTRG;
+
+    // Assert a sync signal. This sets all timers to 0 on next active clock edge
+    AT91C_BASE_TCB->TCB_BCR = 1;
+
+    int frame_count = 0, response = 0, overflow = 0, lastbit = 1, tag_sof = 4;
+    bool rising_edge, reader_frame = false, bSkip = true;
+    uint8_t rx[HITAG_FRAME_LEN];
+    uint8_t tx[HITAG_FRAME_LEN] = {0};
+    size_t rxlen = 0, txlen = 0;
+
+    auth_table_len = 0;
+    auth_table_pos = 0;
+
+    // Reset the received frame, frame count and timing info
+    memset(rx, 0x00, sizeof(rx));
+
+    auth_table = (uint8_t *)BigBuf_malloc(AUTH_TABLE_LENGTH);
+    memset(auth_table, 0x00, AUTH_TABLE_LENGTH);
+
+    while (BUTTON_PRESS() == false)
+    {
+        //DbpString("receive loop");
+
         WDT_HIT();
 
-        /*
-                // only every 1000th times, in order to save time when collecting samples.
-                if (checked == 100) {
-                    if (data_available()) {
-                        checked = -1;
-                        break;
-                    } else {
-                        checked = 0;
+        memset(rx, 0x00, sizeof(rx));
+
+        // Receive frame, watch for at most T0 * EOF periods
+        while (AT91C_BASE_TC1->TC_CV < (HITAG_T0 * HITAG_T_EOF))
+        {
+            //DbpString("frame loop");
+            // Check if rising edge in modulation is detected
+            if (AT91C_BASE_TC1->TC_SR & AT91C_TC_LDRAS)
+            {
+                // Retrieve the new timing values
+                int ra = (AT91C_BASE_TC1->TC_RA / HITAG_T0);
+
+                // Find out if we are dealing with a rising or falling edge
+                rising_edge = (AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_FRAME) > 0;
+
+                // Shorter periods will only happen with reader frames
+                if (reader_frame == false && rising_edge && ra < HITAG_T_TAG_CAPTURE_ONE_HALF)
+                {
+                    // Switch from tag to reader capture
+                    if (ledcontrol)
+                        LED_C_OFF();
+                    reader_frame = true;
+                    rxlen = 0;
+                }
+
+                // Only handle if reader frame and rising edge, or tag frame and falling edge
+                if (reader_frame == rising_edge)
+                {
+                    overflow += ra;
+                    continue;
+                }
+
+                // Add the buffered timing values of earlier captured edges which were skipped
+                Dbprintf("Overflow: %d", overflow);
+                ra += overflow;
+                overflow = 0;
+
+                if (reader_frame)
+                {
+                    DbpString("Reader Frame");
+                    if (ledcontrol)
+                        LED_B_ON();
+                    // Capture reader frame
+                    if (ra >= HITAG_T_STOP)
+                    {
+                        //                      if (rxlen != 0) {
+                        // DbpString("wierd0?");
+                        //                      }
+                        // Capture the T0 periods that have passed since last communication or field drop (reset)
+                        response = (ra - HITAG_T_LOW);
+                    }
+                    else if (ra >= HITAG_T_1_MIN)
+                    {
+                        // '1' bit
+                        DbpString("1");
+                        rx[rxlen / 8] |= 1 << (7 - (rxlen % 8));
+                        rxlen++;
+                    }
+                    else if (ra >= HITAG_T_0_MIN)
+                    {
+                        // '0' bit
+                        DbpString("0");
+                        rx[rxlen / 8] |= 0 << (7 - (rxlen % 8));
+                        rxlen++;
                     }
                 }
-                ++checked;
-        */
-        size_t rxlen = 0, txlen = 0;
-
-        // Keep administration of the first edge detection
-        bool waiting_for_first_edge = true;
-
-        // Did we detected any modulaiton at all
-        bool detected_modulation = false;
-
-        // Use the current modulation state as starting point
-        uint8_t reader_modulation = lf_get_reader_modulation();
-
-        // Receive frame, watch for at most max_nrzs periods
-        // Reset the number of NRZ samples and use edge detection to detect them
-        size_t nrzs = 0;
-        while (nrzs < max_nrzs) {
-            // Get the timing of the next edge in number of wave periods
-            size_t periods = lf_count_edge_periods(128);
-
-            // Just break out of loop after an initial time-out (tag is probably not available)
-            // The function lf_count_edge_periods() returns 0 when a time-out occurs
-            if (periods == 0) {
-                break;
-            }
-
-            if (ledcontrol) LED_A_ON();
-
-            // Are we dealing with the first incoming edge
-            if (waiting_for_first_edge) {
-
-                // Register the number of periods that have passed
-                response = periods;
-
-                // Indicate that we have dealt with the first edge
-                waiting_for_first_edge = false;
-
-                // The first edge is always a single NRZ bit, force periods on 16
-                periods = 16;
-
-                // We have received more than 0 periods, so we have detected a tag response
-                detected_modulation = true;
-            }
-
-            // Evaluate the number of periods before the next edge
-            if (periods > 24 && periods <= 64) {
-                // Detected two sequential equal bits and a modulation switch
-                // NRZ modulation: (11 => --|) or (11 __|)
-                nrz_samples[nrzs++] = reader_modulation;
-                nrz_samples[nrzs++] = reader_modulation;
-                // Invert tag modulation state
-                reader_modulation ^= 1;
-            } else if (periods > 0 && periods <= 24) {
-                // Detected one bit and a modulation switch
-                // NRZ modulation: (1 => -|) or (0 _|)
-                nrz_samples[nrzs++] = reader_modulation;
-                reader_modulation ^= 1;
-            } else {
-                reader_modulation ^= 1;
-                // The function lf_count_edge_periods() returns > 64 periods, this is not a valid number periods
-                Dbprintf("Detected unexpected period count: %d", periods);
-                break;
-            }
-        }
-
-        if (ledcontrol) LED_D_OFF();
-
-        // If there is no response, just repeat the loop
-        if (!detected_modulation) continue;
-
-        if (ledcontrol) LED_A_OFF();
-
-        // Make sure we always have an even number of samples. This fixes the problem
-        // of ending the manchester decoding with a zero. See the example below where
-        // the '|' character is end of modulation
-        //  One at the end: ..._-|_____...
-        // Zero at the end: ...-_|_____...
-        // The last modulation change of a zero is not detected, but we should take
-        // the half period in account, otherwise the demodulator will fail.
-        if ((nrzs % 2) != 0) {
-            nrz_samples[nrzs++] = reader_modulation;
-        }
-
-        if (ledcontrol) LED_B_ON();
-
-        // decode bitstream
-        manrawdecode((uint8_t *)nrz_samples, &nrzs, true, 0);
-
-        // Verify if the header consists of five consecutive ones
-        if (nrzs < 5) {
-            Dbprintf("Detected unexpected number of manchester decoded samples [%d]", nrzs);
-            continue;
-        } else {
-            for (size_t i = 0; i < 5; i++) {
-                if (nrz_samples[i] != 1) {
-                    Dbprintf("Detected incorrect header, the bit [%d] is zero instead of one", i);
+                else
+                {
+                    DbpString("Tag Frame");
+                    if (ledcontrol)
+                        LED_C_ON();
+                    // Capture tag frame (manchester decoding using only falling edges)
+                    if (ra >= HITAG_T_EOF)
+                    {
+                        //                      if (rxlen != 0) {
+                        // DbpString("wierd1?");
+                        //                      }
+                        // Capture the T0 periods that have passed since last communication or field drop (reset)
+                        // We always receive a 'one' first, which has the falling edge after a half period |-_|
+                        response = ra - HITAG_T_TAG_HALF_PERIOD;
+                    }
+                    else if (ra >= HITAG_T_TAG_CAPTURE_FOUR_HALF)
+                    {
+                        // Manchester coding example |-_|_-|-_| (101)
+                        rx[rxlen / 8] |= 0 << (7 - (rxlen % 8));
+                        rxlen++;
+                        rx[rxlen / 8] |= 1 << (7 - (rxlen % 8));
+                        rxlen++;
+                    }
+                    else if (ra >= HITAG_T_TAG_CAPTURE_THREE_HALF)
+                    {
+                        // Manchester coding example |_-|...|_-|-_| (0...01)
+                        rx[rxlen / 8] |= 0 << (7 - (rxlen % 8));
+                        rxlen++;
+                        // We have to skip this half period at start and add the 'one' the second time
+                        if (bSkip == false)
+                        {
+                            rx[rxlen / 8] |= 1 << (7 - (rxlen % 8));
+                            rxlen++;
+                        }
+                        lastbit = !lastbit;
+                        bSkip = !bSkip;
+                    }
+                    else if (ra >= HITAG_T_TAG_CAPTURE_TWO_HALF)
+                    {
+                        //DbpString("two half");
+                        // Manchester coding example |_-|_-| (00) or |-_|-_| (11)
+                        if (tag_sof)
+                        {
+                            // Ignore bits that are transmitted during SOF
+                            tag_sof--;
+                        }
+                        else
+                        {
+                            // bit is same as last bit
+                            rx[rxlen / 8] |= lastbit << (7 - (rxlen % 8));
+                            rxlen++;
+                        }
+                    }
                 }
             }
-        }
-
-        // Pack the response into a byte array
-        for (size_t i = 5; i < 37; i++) {
-            uint8_t bit = nrz_samples[i];
-            rx[rxlen / 8] |= bit << (7 - (rxlen % 8));
-            rxlen++;
         }
 
         // Check if frame was captured
-        if (rxlen > 4) {
-
-            LogTraceBits(rx, rxlen, response, response, true);
+        if (rxlen > 1 && reader_frame)
+        {
+            DbpString("process reader frame");
+            Dbprintf("Reader: %d :%02x %02x %02x %02x %02x", rxlen,rx[0], rx[1], rx[2], rx[3], rx[4]);
+            frame_count++;
+            LogTraceBits(rx, rxlen, response, 0, reader_frame);
 
             // Process the incoming frame (rx) and prepare the outgoing frame (tx)
             hitag2_handle_reader_command(rx, rxlen, tx, &txlen);
@@ -1505,22 +1541,74 @@ void SimulateHitag2(bool ledcontrol) {
             lf_wait_periods(HITAG_T_WAIT_1_MIN);
 
             // Send and store the tag answer (if there is any)
-            if (txlen) {
+            if (txlen)
+            {
+                DbpString("Send tag answer");
+                Dbprintf("Tag: %d : %02x %02x %02x %02x %02x", txlen, tx[0], tx[1], tx[2], tx[3], tx[4]);
                 // Transmit the tag frame
-                //hitag_send_frame(tx, txlen);
+                // hitag_send_frame(tx, txlen);
                 lf_manchester_send_bytes(tx, txlen, ledcontrol);
 
                 // Store the frame in the trace
                 LogTraceBits(tx, txlen, 0, 0, false);
             }
-
+            
             // Reset the received frame and response timing info
             memset(rx, 0x00, sizeof(rx));
             response = 0;
+            reader_frame = false;
+            lastbit = 1;
+            bSkip = true;
+            tag_sof = 4;
+            overflow = 0;
 
-            if (ledcontrol) LED_B_OFF();
+            if (ledcontrol)
+            {
+                LED_B_OFF();
+                LED_C_OFF();
+            }
         }
+        else
+        {
+            // Save the timer overflow, will be 0 when frame was received
+            DbpString("Overflow save");
+            overflow += (AT91C_BASE_TC1->TC_CV / HITAG_T0);
+        }
+        // Reset the frame length
+        rxlen = 0;
+
+
+        //test
+        // Disable timer during configuration
+        AT91C_BASE_TC1->TC_CCR = AT91C_TC_CLKDIS;
+
+        // Capture mode, default timer source = MCK/2 (TIMER_CLOCK1), TIOA is external trigger,
+        // external trigger rising edge, load RA on rising edge of TIOA.
+        AT91C_BASE_TC1->TC_CMR = AT91C_TC_CLKS_TIMER_DIV1_CLOCK | AT91C_TC_ETRGEDG_BOTH | AT91C_TC_ABETRG | AT91C_TC_LDRA_BOTH;
+
+        // Enable and reset counter
+        AT91C_BASE_TC1->TC_CCR = AT91C_TC_CLKEN | AT91C_TC_SWTRG;
+
+        // Assert a sync signal. This sets all timers to 0 on next active clock edge
+        AT91C_BASE_TCB->TCB_BCR = 1;
+        // /test
+
+
+        // Reset the timer to restart while-loop that receives frames
+        //AT91C_BASE_TC1->TC_CCR = AT91C_TC_SWTRG;
+        //AT91C_BASE_TC1->TC_CCR = AT91C_TC_SWTRG;
+
+        // Assert a sync signal. This sets all timers to 0 on next active clock edge
+        //AT91C_BASE_TCB->TCB_BCR = 1;
     }
+
+    if (ledcontrol)
+        LEDsoff();
+    AT91C_BASE_TC1->TC_CCR = AT91C_TC_CLKDIS;
+    AT91C_BASE_TC0->TC_CCR = AT91C_TC_CLKDIS;
+
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+    set_tracing(false);
 
     lf_finalize(ledcontrol);
 
@@ -1529,7 +1617,7 @@ void SimulateHitag2(bool ledcontrol) {
 
     DbpString("Sim stopped");
 
-//    reply_ng(CMD_LF_HITAG_SIMULATE, (checked == -1) ? PM3_EOPABORTED : PM3_SUCCESS, (uint8_t *)tag.sectors, tag_size);
+    //    reply_ng(CMD_LF_HITAG_SIMULATE, (checked == -1) ? PM3_EOPABORTED : PM3_SUCCESS, (uint8_t *)tag.sectors, tag_size);
 }
 
 void ReaderHitag(hitag_function htf, hitag_data *htd, bool ledcontrol) {
