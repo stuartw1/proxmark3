@@ -36,6 +36,9 @@
 // T0 = timer/carrier = 1500kHz/125kHz = 1500000/125000 = 6
 //#define HITAG_T0 3
 
+//define Hitag T0 in milliseconds for use with SpinDelayUS 8us
+#define HITAG_T0_US 8
+
 //////////////////////////////////////////////////////////////////////////////
 // Exported global variables
 //////////////////////////////////////////////////////////////////////////////
@@ -94,21 +97,25 @@ static size_t lf_count_edge_periods_ex(size_t max, bool wait, bool detect_gap) {
     size_t periods = 0;
     uint8_t avg_peak = adc_avg + LIMIT_DEV;
     uint8_t avg_through = adc_avg - LIMIT_DEV;
+    LED_A_ON();
 
     while (BUTTON_PRESS() == false) {
         WDT_HIT();
 
         timeout--;
         if (timeout == 0) {
+            DbpString("timeout");
             return 0;
         }
 
         if (AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY)) {
             AT91C_BASE_SSC->SSC_THR = 0x00;
+            LED_C_ON();
             continue;
         }
 
         if (AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_RXRDY)) {
+            LED_C_OFF();
 
             periods++;
 
@@ -151,6 +158,8 @@ static size_t lf_count_edge_periods_ex(size_t max, bool wait, bool detect_gap) {
             previous_adc_val = adc_val;
 
             if (periods >= max) {
+                LED_A_OFF();
+                //LED_C_OFF();
                 return 0;
             }
         }
@@ -192,8 +201,10 @@ bool lf_get_reader_modulation(void) {
 }
 
 void lf_wait_periods(size_t periods) {
+    //detect gap wasn't working so trying SpinDelayUs which accepts microseconds
+    SpinDelayUs(HITAG_T0_US*periods);
     //       wait  detect gap
-    lf_count_edge_periods_ex(periods, true, false);
+    //lf_count_edge_periods_ex(periods, true, false);
 }
 
 void lf_init(bool reader, bool simulate, bool ledcontrol) {
@@ -332,17 +343,18 @@ void lf_modulation(bool modulation) {
 
 // simulation
 static void lf_manchester_send_bit(uint8_t bit) {
-    lf_modulation(bit != 0);
-    lf_wait_periods(16);
+    // 1 high -> low
+    // 0 low -> high
+    lf_modulation(bit != 0); 
+    lf_wait_periods(15);
     lf_modulation(bit == 0);
-    lf_wait_periods(32);
+    lf_wait_periods(15);
 }
 
 // simulation
 bool lf_manchester_send_bytes(const uint8_t *frame, size_t frame_len, bool ledcontrol) {
 
     if (ledcontrol) LED_B_ON();
-
     lf_manchester_send_bit(1);
     lf_manchester_send_bit(1);
     lf_manchester_send_bit(1);
@@ -352,8 +364,10 @@ bool lf_manchester_send_bytes(const uint8_t *frame, size_t frame_len, bool ledco
     // Send the content of the frame
     for (size_t i = 0; i < frame_len; i++) {
         lf_manchester_send_bit((frame[i / 8] >> (7 - (i % 8))) & 1);
+        //Dbprintf("i: %d", i);
     }
 
     if (ledcontrol) LED_B_OFF();
+    //DbpString("exit tx");
     return true;
 }

@@ -1378,10 +1378,10 @@ void SimulateHitag2(bool ledcontrol)
     // Assert a sync signal. This sets all timers to 0 on next active clock edge
     AT91C_BASE_TCB->TCB_BCR = 1;
 
-    int frame_count = 0, response = 0, overflow = 0, lastbit = 1, tag_sof = 4;
+    int frame_count = 0, response = 0, overflow = 0, lastbit = 1, tag_sof = 4, delta = 0;
     bool rising_edge, reader_frame = false, bSkip = true;
     uint8_t rx[HITAG_FRAME_LEN];
-    uint8_t tx[HITAG_FRAME_LEN] = {0};
+    uint8_t tx[HITAG_FRAME_LEN];
     size_t rxlen = 0, txlen = 0;
 
     auth_table_len = 0;
@@ -1389,6 +1389,7 @@ void SimulateHitag2(bool ledcontrol)
 
     // Reset the received frame, frame count and timing info
     memset(rx, 0x00, sizeof(rx));
+    memset(tx, 0x00, sizeof(tx));
 
     auth_table = (uint8_t *)BigBuf_malloc(AUTH_TABLE_LENGTH);
     memset(auth_table, 0x00, AUTH_TABLE_LENGTH);
@@ -1400,6 +1401,7 @@ void SimulateHitag2(bool ledcontrol)
         WDT_HIT();
 
         memset(rx, 0x00, sizeof(rx));
+        memset(tx, 0x00, sizeof(tx));
 
         // Receive frame, watch for at most T0 * EOF periods
         while (AT91C_BASE_TC1->TC_CV < (HITAG_T0 * HITAG_T_EOF))
@@ -1431,14 +1433,19 @@ void SimulateHitag2(bool ledcontrol)
                     continue;
                 }
 
+                //Skip all 'tag' frames as we are simulating a tag
+                if (reader_frame == false){
+                    continue;
+                }
+
                 // Add the buffered timing values of earlier captured edges which were skipped
-                Dbprintf("Overflow: %d", overflow);
+                //Dbprintf("Overflow: %d", overflow);
                 ra += overflow;
                 overflow = 0;
 
                 if (reader_frame)
                 {
-                    DbpString("Reader Frame");
+                    //DbpString("Reader Frame");
                     if (ledcontrol)
                         LED_B_ON();
                     // Capture reader frame
@@ -1523,10 +1530,10 @@ void SimulateHitag2(bool ledcontrol)
         }
 
         // Check if frame was captured
-        if (rxlen > 1 && reader_frame)
+        if (rxlen > 4 && reader_frame)
         {
             DbpString("process reader frame");
-            Dbprintf("Reader: %d :%02x %02x %02x %02x %02x", rxlen,rx[0], rx[1], rx[2], rx[3], rx[4]);
+            Dbprintf("Reader: %d :%02x %02x %02x %02x %02x delta: %d", rxlen,rx[0], rx[1], rx[2], rx[3], rx[4], delta);
             frame_count++;
             LogTraceBits(rx, rxlen, response, 0, reader_frame);
 
@@ -1538,7 +1545,7 @@ void SimulateHitag2(bool ledcontrol)
             // with respect to the falling edge, we need to wait actually (T_Wait1 - T_Low)
             // periods. The gap time T_Low varies (4..10). All timer values are in
             // terms of T0 units (HITAG_T_WAIT_1_MIN - HITAG_T_LOW )
-            lf_wait_periods(HITAG_T_WAIT_1_MIN);
+            lf_wait_periods((HITAG_T_WAIT_1_MIN - delta));
 
             // Send and store the tag answer (if there is any)
             if (txlen)
@@ -1548,6 +1555,8 @@ void SimulateHitag2(bool ledcontrol)
                 // Transmit the tag frame
                 // hitag_send_frame(tx, txlen);
                 lf_manchester_send_bytes(tx, txlen, ledcontrol);
+                //increment delta by 4
+                delta+=4;
 
                 // Store the frame in the trace
                 LogTraceBits(tx, txlen, 0, 0, false);
@@ -1555,12 +1564,17 @@ void SimulateHitag2(bool ledcontrol)
             
             // Reset the received frame and response timing info
             memset(rx, 0x00, sizeof(rx));
+            memset(tx, 0x00, sizeof(tx));
+            rxlen = 0;
+            txlen = 0;
             response = 0;
             reader_frame = false;
             lastbit = 1;
             bSkip = true;
             tag_sof = 4;
             overflow = 0;
+
+            
 
             if (ledcontrol)
             {
@@ -1571,35 +1585,36 @@ void SimulateHitag2(bool ledcontrol)
         else
         {
             // Save the timer overflow, will be 0 when frame was received
-            DbpString("Overflow save");
+            //DbpString("Overflow save");
             overflow += (AT91C_BASE_TC1->TC_CV / HITAG_T0);
         }
         // Reset the frame length
         rxlen = 0;
+        txlen = 0;
 
 
         //test
         // Disable timer during configuration
-        AT91C_BASE_TC1->TC_CCR = AT91C_TC_CLKDIS;
+        //AT91C_BASE_TC1->TC_CCR = AT91C_TC_CLKDIS;
 
         // Capture mode, default timer source = MCK/2 (TIMER_CLOCK1), TIOA is external trigger,
         // external trigger rising edge, load RA on rising edge of TIOA.
-        AT91C_BASE_TC1->TC_CMR = AT91C_TC_CLKS_TIMER_DIV1_CLOCK | AT91C_TC_ETRGEDG_BOTH | AT91C_TC_ABETRG | AT91C_TC_LDRA_BOTH;
+        //AT91C_BASE_TC1->TC_CMR = AT91C_TC_CLKS_TIMER_DIV1_CLOCK | AT91C_TC_ETRGEDG_BOTH | AT91C_TC_ABETRG | AT91C_TC_LDRA_BOTH;
 
         // Enable and reset counter
-        AT91C_BASE_TC1->TC_CCR = AT91C_TC_CLKEN | AT91C_TC_SWTRG;
+        //AT91C_BASE_TC1->TC_CCR = AT91C_TC_CLKEN | AT91C_TC_SWTRG;
 
         // Assert a sync signal. This sets all timers to 0 on next active clock edge
-        AT91C_BASE_TCB->TCB_BCR = 1;
+        //AT91C_BASE_TCB->TCB_BCR = 1;
         // /test
 
 
         // Reset the timer to restart while-loop that receives frames
-        //AT91C_BASE_TC1->TC_CCR = AT91C_TC_SWTRG;
-        //AT91C_BASE_TC1->TC_CCR = AT91C_TC_SWTRG;
+        AT91C_BASE_TC1->TC_CCR = AT91C_TC_SWTRG;
+        AT91C_BASE_TC1->TC_CCR = AT91C_TC_SWTRG;
 
         // Assert a sync signal. This sets all timers to 0 on next active clock edge
-        //AT91C_BASE_TCB->TCB_BCR = 1;
+        AT91C_BASE_TCB->TCB_BCR = 1;
     }
 
     if (ledcontrol)
